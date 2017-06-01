@@ -1,10 +1,62 @@
-import select
-import socket
-import threading
+import asyncio
 import time
+import traceback
 
 from .blacklist import Blacklist
-from .ts3client import Ts3Client
+
+
+class UdpRelayServer(asyncio.DatagramProtocol):
+    """
+    The server protocol waits for data from real TeamSpeak clients.
+    """
+
+    def __init__(self, relay):
+        self.relay = relay
+        self.transport = None
+
+    def connection_made(self, transport):
+        print("UDP server started")
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        print("received data from", addr, ":", data)
+        self.relay.handle_data_from_client(data, addr)
+
+    def sendto(self, data, addr):
+        """
+        Send data to the TeamSpeak client.
+        """
+        self.transport.sendto(data, addr)
+
+
+class UdpRelayClient(asyncio.DatagramProtocol):
+    """
+    The client protocol sends data to the real TeamSpeak server.
+    """
+
+    def __init__(self, relay, addr):
+        self.relay = relay
+        self.addr = addr  # client address
+        self.last_seen = time.time()
+        self.transport = None
+
+    def connection_made(self, transport):
+        print("connected to UDP server")
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        # relay data to TeamSpeak client
+        self.relay.socket.sendto(data, self.addr)
+
+    def connection_lost(self, exc):
+        print("disconnected from UDP server")
+
+    def send(self, data):
+        """
+        Send data to the TeamSpeak server.
+        """
+        self.last_seen = time.time()
+        self.transport.sendto(data)
 
 
 class UdpRelay:
@@ -16,8 +68,6 @@ class UdpRelay:
                  relay_address="0.0.0.0", relay_port=9987,
                  remote_address="127.0.0.1", remote_port=9987,
                  blacklist_file="blacklist.txt", whitelist_file="whitelist.txt"):
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.bind((relay_address, relay_port))
         self.relay_address = relay_address
         self.relay_port = relay_port
         self.remote_address = remote_address
@@ -25,71 +75,9 @@ class UdpRelay:
         self.blacklist = Blacklist(blacklist_file, whitelist_file)
         self.logging = logging
         self.statistics = statistics
-        self.clients = {}
-
-        self.thread = None
-        self.run_loop = True
-
-    def disconnect_client(self, addr, socket):
-        if socket:
-            try:
-                socket.close()
-            except OSError:
-                pass
-        if addr in self.clients:
-            del self.clients[addr]
-            self.statistics.remove_user(addr)
-
-    def start_thread(self):
-        self.thread = threading.Thread(target=self.relay)
-        self.thread.start()
-        self.run_loop = True
-
-    def stop_thread(self):
-        self.run_loop = False
-        # close one socket so that select returns
-        self.socket.close()
-
-    def relay(self):
-        while True:
-            readable, writable, exceptional = select.select(list(self.clients.values()) + [self.socket], [], [], 1)
-            if not self.run_loop:
-                # stop thread
-                break
-            for s in readable:
-                # if ts3 server answers to a client
-                if isinstance(s, Ts3Client):
-                    data, addr = s.socket.recvfrom(1024)
-                    self.socket.sendto(data, s.addr)
-                else:
-                    # if a client sends something to a ts3 server
-                    data, addr = s.recvfrom(1024)
-                    # check if the client is denied by our blacklist
-                    if self.blacklist.check(addr[0]):
-                        # if its a new and unkown client
-                        if addr not in self.clients:
-                            if not self.statistics.user_limit_reached():
-                                self.logging.debug('connection from: {}'.format(addr))
-                                self.clients[addr] = Ts3Client(socket.socket(socket.AF_INET, socket.SOCK_DGRAM), addr)
-                                self.statistics.add_user(addr)
-                            else:
-                                self.logging.info('connection from {} not allowed. user limit ({}) reached.'.format(
-                                    addr[0], self.statistics.max_users))
-                                self.disconnect_client(addr, None)
-                        # send data to ts3 server
-                        if addr in self.clients:
-                            self.clients[addr].socket.sendto(data, (self.remote_address, self.remote_port))
-                    else:
-                        self.logging.info('connection from {} not allowed. blacklisted.'.format(addr[0]))
-                        if addr not in self.clients:
-                            self.disconnect_client(addr, None)
-                        else:
-                            self.disconnect_client(addr, self.clients[addr].socket)
-            # close sockets of disconnected clients
-            for addr, client in list(self.clients.items()):
-                if client.last_seen <= time.time() - 2:
-                    self.logging.debug('disconnected: {}'.format(addr))
-                    self.disconnect_client(addr, client.socket)
+        self.server = None
+        self.clients = {}  # address -> UdpRelayClient
+        self.scheduler_handle = None
 
     @classmethod
     def create_from_config(cls, logging, statistics, relay_config):
@@ -103,3 +91,68 @@ class UdpRelay:
             blacklist_file=relay_config['blacklist'],
             whitelist_file=relay_config['whitelist'],
         )
+
+    async def start(self):
+        """
+        Start server protocol.
+        """
+        loop = asyncio.get_event_loop()
+        transport, self.server = await loop.create_datagram_endpoint(
+            lambda: UdpRelayServer(self),
+            local_addr=(self.relay_address, self.relay_port),
+        )
+        self.scheduler_handle = loop.call_soon(self.scheduler)
+
+    def close(self):
+        """
+        Close server and client protocols.
+        """
+        self.scheduler_handle.cancel()
+        self.server.transport.close()
+        for client in self.clients.values():
+            self.disconnect_client(client)
+
+    def disconnect_client(self, client):
+        client.transport.close()
+        del self.clients[client.addr]
+        self.statistics.remove_user(client.addr)
+
+    def disconnect_inactive_clients(self):
+        """
+        Disconnect inactive clients.
+        """
+        for addr, client in self.clients.items():
+            if client.last_seen <= time.time() - 2:
+                self.logging.debug('disconnected: {}'.format(addr))
+                self.disconnect_client(addr)
+
+    def scheduler(self):
+        print("schedule")
+        self.disconnect_inactive_clients()
+        self.scheduler_handle = asyncio.get_event_loop().call_later(1, self.scheduler)
+
+    def handle_data_from_client(self, data, addr):
+        # check if the client is denied by our blacklist
+        if self.blacklist.check(addr[0]):
+            # if it's a new and unknown client
+            if addr not in self.clients:
+                if not self.statistics.user_limit_reached():
+                    self.logging.debug('connection from: {}'.format(addr))
+                    loop = asyncio.get_event_loop()
+                    client_protocol = UdpRelayClient(self, addr)
+                    self.clients[addr] = client_protocol
+                    loop.create_task(loop.create_datagram_endpoint(
+                        lambda: client_protocol,
+                        remote_addr=(self.remote_address, self.remote_port),
+                    ))
+                    self.statistics.add_user(addr)
+                else:
+                    self.logging.info('connection from {} not allowed. user limit ({}) reached.'.format(
+                        addr[0], self.statistics.max_users))
+            # send data to ts3 server
+            if addr in self.clients:
+                self.clients[addr].send(data, (self.remote_address, self.remote_port))
+        else:
+            self.logging.info('connection from {} not allowed. blacklisted.'.format(addr[0]))
+            if addr in self.clients:
+                self.disconnect_client(self.clients[addr])

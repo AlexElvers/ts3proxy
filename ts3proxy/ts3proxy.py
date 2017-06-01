@@ -1,6 +1,7 @@
 import logging
 import sys
 
+import asyncio
 import yaml
 
 from .udp import UdpRelay
@@ -33,7 +34,7 @@ def main():
     services = []
     if config['ts3server']['enabled']:
         ts3_server = UdpRelay.create_from_config(logging, statistics, config['ts3server'])
-        ts3_server.start_thread()
+        asyncio.ensure_future(ts3_server.start())
         services.append(ts3_server)
         logging.info('Voice: {0.relay_address}:{0.relay_port} <-> {0.remote_address}:{0.remote_port}'.format(
             ts3_server
@@ -66,16 +67,13 @@ def main():
             weblist_server
         ))
 
+    loop = asyncio.get_event_loop()
     try:
         # now all services are started
-        # wait for threads to stop or for keyboard interrupt
-        for service in services:
-            service.thread.join()
+        # run until keyboard interrupt
+        loop.run_forever()
     except KeyboardInterrupt:
-        logging.info('received KeyboardInterrupt, stopping threads')
+        logging.info('received KeyboardInterrupt, stopping services')
         for service in services:
-            service.stop_thread()
-        logging.info('closed sockets, waiting for threads to stop')
-        for service in services:
-            service.thread.join()
-        logging.info('threads stopped')
+            service.close()
+        loop.close()
